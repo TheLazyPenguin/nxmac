@@ -2,6 +2,8 @@
 # Patterns, so a new test needs no line here; the sources (t_*.c, t_*.m) and everything else with an extension stay tracked
 t_*
 !t_*.*
+bench_*
+!bench_*.*
 *.dSYM/
 # Tools built here that are not tests
 nvn_replay

@@ -1,4 +1,5 @@
 // Metal execution layer of the NVN null device, see nvn_mtl.h.
+#import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
@@ -322,12 +323,45 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
 // added (resource_vis). Heaps idle for RH_IDLE_NS, and the oldest past
 // RH_CAP bytes waiting, leave the residency set when a submission begins (rh_trim). DM_NVN_RT_RECYCLE=0 makes each texture its own allocation and each family heap exact and freed
 // with its last texture, as before; ab alternates it with the DM_AB phases
-enum { RH_CAP = 256u << 20 }; static const uint64_t RH_IDLE_NS = 3000000000ull;
+static inline uint64_t rh_cap(void) {
+    const char *e = getenv("DM_NVN_RH_CAP");
+    if (e && *e) {
+        char *end = NULL; long long v = strtoll(e, &end, 0);
+        if (v >= 0) return (uint64_t)v << 20;
+    }
+    return 256u << 20;
+}
+static inline uint64_t rh_idle_ns(void) {
+    const char *e = getenv("DM_NVN_RH_IDLE_MS");
+    if (e && *e) {
+        char *end = NULL; long long v = strtoll(e, &end, 0);
+        if (v >= 0) return (uint64_t)v * 1000000ull;
+    }
+    return 3000000000ull;
+}
+#define RH_CAP (rh_cap())
+#define RH_IDLE_NS (rh_idle_ns())
 typedef struct { void *heap; uint64_t size, t; } rh_ent;   // heap: retained (CFBridgingRetain); t: when it began to wait
 static os_unfair_lock g_rh_lk = OS_UNFAIR_LOCK_INIT; static rh_ent *g_rh; static unsigned g_rh_n, g_rh_cap; static uint64_t g_rh_bytes;
 static _Atomic uint64_t g_rh_made, g_rh_reused, g_rh_trimmed;   // for the memory readout
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
-static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_RECYCLE", 1); return m; }
+static dispatch_source_t g_rh_mp_src;
+static void rh_trim_drop(int all);
+static void rh_init_pressure(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
+        g_rh_mp_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                             DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, q);
+        if (g_rh_mp_src) {
+            dispatch_source_set_event_handler(g_rh_mp_src, ^{
+                rh_trim_drop(1);
+            });
+            dispatch_resume(g_rh_mp_src);
+        }
+    });
+}
+static int rh_mode(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_RT_RECYCLE", 1); rh_init_pressure(); } return m; }
 // A heap whose texture was freed waits for the next texture it fits (with the switch off it is freed). Runs where the texture's last reference goes (defer_drain: the submit thread or a
 // completion handler)
 static void rh_wait(id<MTLHeap> heap) {
@@ -395,20 +429,31 @@ static id<MTLTexture> rh_texture(const tex_t *t, MTLTextureDescriptor *d) {
         || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return nil;
     return rh_place(d);
 }
-// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed
-static void rh_trim(void) {
-    if (!g_rh_n) return;
-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); void *drop[64]; unsigned nd = 0;
-    os_unfair_lock_lock(&g_rh_lk);
-    while (g_rh_n && nd < 64) {
-        unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-        if (now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
-        drop[nd++] = g_rh[old].heap; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
+// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed.
+// Under OS memory pressure (all = 1): all idle waiting heaps are immediately dropped and freed
+static void rh_trim_drop(int all) {
+    uint64_t idle_ns = RH_IDLE_NS, cap_bytes = RH_CAP;
+    while (1) {
+        if (!g_rh_n) return;
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); void *drop[64]; unsigned nd = 0;
+        os_unfair_lock_lock(&g_rh_lk);
+        while (g_rh_n && nd < 64) {
+            unsigned old = 0;
+            if (!all) {
+                for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
+                if (now - g_rh[old].t < idle_ns && g_rh_bytes <= cap_bytes) break;
+            } else {
+                old = g_rh_n - 1;
+            }
+            drop[nd++] = g_rh[old].heap; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
+        }
+        os_unfair_lock_unlock(&g_rh_lk);
+        for (unsigned i = 0; i < nd; i++) { id<MTLHeap> h = CFBridgingRelease(drop[i]); res_remove(h); }
+        if (nd) atomic_fetch_add(&g_rh_trimmed, nd);
+        if (!all || nd < 64) break;
     }
-    os_unfair_lock_unlock(&g_rh_lk);
-    for (unsigned i = 0; i < nd; i++) { id<MTLHeap> h = CFBridgingRelease(drop[i]); res_remove(h); }
-    if (nd) atomic_fetch_add(&g_rh_trimmed, nd);
 }
+static void rh_trim(void) { rh_trim_drop(0); }
 // The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold
 @interface NvAtomicRaw : NSObject { @public id<MTLTexture> raw; } @end
 @implementation NvAtomicRaw
@@ -737,6 +782,7 @@ void mtl_init(void) {
     dm_res_report_register(mtl_res_counts);
     if (!g_nvn_deswz_gpu) MLOG("[RED] GPU deswizzle init failed; swizzled textures fall back to the CPU");
     MLOG("Metal device %s", g_dev.name.UTF8String);
+    rh_init_pressure();
     udc_selftest();
 }
 
@@ -15009,10 +15055,16 @@ static void dlss_eval(const p_dlss *c) {
         sc.colorTexture = col; sc.depthTexture = dep; sc.motionTexture = mot; sc.outputTexture = out; sc.exposureTexture = expo;
         sc.inputContentWidth = iw; sc.inputContentHeight = ih;
         if (@available(macOS 27.0, iOS 27.0, *)) {   // the rectangles' corners: all at the origin on the game seen, so an older system loses nothing there
-            sc.colorContentOffsetX = (NSUInteger)a.base[DLSS_COLOR][0]; sc.colorContentOffsetY = (NSUInteger)a.base[DLSS_COLOR][1];
-            sc.depthContentOffsetX = (NSUInteger)a.base[DLSS_DEPTH][0]; sc.depthContentOffsetY = (NSUInteger)a.base[DLSS_DEPTH][1];
-            sc.motionContentOffsetX = (NSUInteger)a.base[DLSS_MOTION][0]; sc.motionContentOffsetY = (NSUInteger)a.base[DLSS_MOTION][1];
-            sc.outputOffsetX = (NSUInteger)a.base[DLSS_OUTPUT][0]; sc.outputOffsetY = (NSUInteger)a.base[DLSS_OUTPUT][1];
+            if ([sc respondsToSelector:NSSelectorFromString(@"setColorContentOffsetX:")]) {
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_COLOR][0]) forKey:@"colorContentOffsetX"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_COLOR][1]) forKey:@"colorContentOffsetY"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_DEPTH][0]) forKey:@"depthContentOffsetX"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_DEPTH][1]) forKey:@"depthContentOffsetY"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_MOTION][0]) forKey:@"motionContentOffsetX"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_MOTION][1]) forKey:@"motionContentOffsetY"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_OUTPUT][0]) forKey:@"outputOffsetX"];
+                [(id)sc setValue:@((NSUInteger)a.base[DLSS_OUTPUT][1]) forKey:@"outputOffsetY"];
+            }
         }
         sc.motionVectorScaleX = a.mv[0]; sc.motionVectorScaleY = a.mv[1];
         sc.jitterOffsetX = a.jitter[0]; sc.jitterOffsetY = a.jitter[1];

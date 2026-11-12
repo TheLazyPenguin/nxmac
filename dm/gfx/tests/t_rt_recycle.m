@@ -104,6 +104,40 @@ int main(void) { @autoreleasepool {
         if (e) { defer_obj_release(e->snap); e->snap = nil; e->ser = 0; }
         settle();
         CHECK(waiting() == 1, "its heap waits once the snapshot is freed");
+        CHECK(g_rh_mp_src != NULL, "OS memory pressure event source is registered");
+        rh_trim_drop(1);
+        CHECK(waiting() == 0, "immediate memory pressure trim drops all idle waiting heaps");
+    }
+    {   // RH_CAP and RH_IDLE_NS env var configuration
+        setenv("DM_NVN_RH_CAP", "128", 1);
+        CHECK(RH_CAP == (128ull << 20), "DM_NVN_RH_CAP in MB is configurable via env var");
+        unsetenv("DM_NVN_RH_CAP");
+        CHECK(RH_CAP == (256ull << 20), "RH_CAP defaults to 256 MB");
+
+        setenv("DM_NVN_RH_IDLE_MS", "1500", 1);
+        CHECK(RH_IDLE_NS == 1500000000ull, "DM_NVN_RH_IDLE_MS is configurable via env var");
+        unsetenv("DM_NVN_RH_IDLE_MS");
+        CHECK(RH_IDLE_NS == 3000000000ull, "RH_IDLE_NS defaults to 3000 ms");
+    }
+    {   // alias_take_over evicts all eligible candidates without a 16-entry cap
+        tex_t small[20];
+        for (int i = 0; i < 20; i++) {
+            small[i] = target(&pool, 96000 + i, (uint64_t)i * (128 << 10), 64, 64);
+            mtl_tex_init(&small[i]);
+            tex_mtl(&small[i]);
+        }
+        for (int i = 0; i < 20; i++) {
+            mtl_tex_release(&small[i]);
+        }
+        settle();
+        g_fence += 20;   // ensure all candidates pass ALIAS_IDLE
+        uint64_t taken_before = own_alias_stats_locked().taken;
+        tex_t big = target(&pool, 97000, 0, 1024, 1024);
+        mtl_tex_init(&big);
+        tex_mtl(&big);
+        CHECK(own_alias_stats_locked().taken - taken_before == 20, "alias_take_over evicts all 20 overlapping stale unreferenced candidates");
+        mtl_tex_release(&big);
+        settle();
     }
     mtl_sub_commit(); mtl_drain(); free(mem);
     printf("t_rt_recycle: %d checks, %d failed\n", checks, failed); return failed != 0;

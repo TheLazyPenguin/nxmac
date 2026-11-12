@@ -194,10 +194,12 @@ static uint32_t alias_take_over(const alias_key *nk, uint64_t now) {
     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
     if (!L.size) return 0;
     int64_t lo = nk->off, hi = nk->off + (int64_t)L.size;
-    uint32_t n = 0; alias_key ks[16];
-    for (int64_t c = lo >> ALIAS_CELL; c <= (hi - 1) >> ALIAS_CELL && n < 16; c++) {   // the entries whose storage reaches into this one's cells (alias_index)
+    uint32_t n = 0, cap = 32;
+    alias_key stk[32]; alias_key *ks = stk;
+    int oom = 0;
+    for (int64_t c = lo >> ALIAS_CELL; c <= (hi - 1) >> ALIAS_CELL && !oom; c++) {   // the entries whose storage reaches into this one's cells (alias_index)
         uint64_t ck[2] = {nk->pool, (uint64_t)c}; const alias_cell *v = nvn_hm_get(&g_alias_cells, ck);
-        for (uint32_t i = 0; v && i < v->n && n < 16; i++) {
+        for (uint32_t i = 0; v && i < v->n; i++) {
             const alias_key *k = &v->e[i].k;
             if (!memcmp(k, nk, sizeof *k) || k->off >= hi || v->e[i].end <= lo) continue;
             uint32_t j = 0; while (j < n && memcmp(&ks[j], k, sizeof *k)) j++;
@@ -205,11 +207,20 @@ static uint32_t alias_take_over(const alias_key *nk, uint64_t now) {
             void *val = nvn_hm_get(&g_alias, k); if (!val) continue;
             uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, k);
             if ((seen && now - seen < ALIAS_IDLE) || serial_table_holds(val)) continue;
+            if (n == cap) {
+                uint32_t ncap = cap * 2;
+                alias_key *nks = malloc(ncap * sizeof *nks);
+                if (!nks) { oom = 1; break; }
+                memcpy(nks, ks, n * sizeof *ks);
+                if (ks != stk) free(ks);
+                ks = nks; cap = ncap;
+            }
             ks[n++] = *k;
         }
     }
     for (uint32_t j = 0; j < n; j++) alias_del(&ks[j]);
     if (n) { own_note(0); g_alias_taken += n; }
+    if (ks != stk) free(ks);
     return n;
 }
 uint32_t own_alias_take_over_locked(const alias_key *k) { return alias_take_over(k, own_hook_submission()); }
