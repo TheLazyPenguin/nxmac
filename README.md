@@ -38,7 +38,7 @@ Community projects build on nxnative with tools to turn your games into apps for
 
 ## Requirements
 
-- **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2.
+- **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2 (or Command Line Tools with standalone Metal shims, see [Building without Xcode](#building-on-mac-without-full-xcode-command-line-tools-only)).
 - **iPhone:** A17 Pro chip or later, with iOS 26 or later.
 - **iPad:** M1 chip or later, with iPadOS 26 or later.
 
@@ -82,6 +82,64 @@ python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys
 The IPA appears in the game's folder. The first build takes 30–60 minutes and needs free disk space of about twice the game's size plus 10 GB; building again is much faster.
 
 To play on the Mac instead, add `--platform mac-app`: you get a Mac app of the game to open from Finder. All options: [The packing script in detail](docs/development.md#the-packing-script-in-detail).
+
+### Building on Mac without full Xcode (Command Line Tools only)
+
+If you only have Apple's Command Line Tools installed (`xcode-select --install`) and lack the full `Xcode.app`, you can still build and run games natively on macOS without downloading Xcode:
+
+1. **Why Xcode is normally expected**: The packaging pipeline calls `metal` and `metallib` CLI binaries to compile translated MSL shaders into Metal libraries, which Apple only includes with full Xcode installations.
+2. **The workaround**: The macOS Metal runtime framework (`Metal.framework`) already supports runtime compilation (`[MTLDevice newLibraryWithSource:options:error:]`) and library serialization (`[MTLLibrary serializeToURL:error:]`). You can create lightweight shim binaries for `metal` and `metallib` in any directory in your `PATH` (e.g. `~/.local/bin` or your virtualenv's `bin`):
+
+```bash
+# Compile standalone metal / metallib CLI shims
+cat << 'EOF' > /tmp/metal_shim.m
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+@interface NSObject ()
+- (BOOL)serializeToURL:(NSURL *)url error:(NSError **)error;
+@end
+int main(int argc, const char *argv[]) {
+    @autoreleasepool {
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+                printf("Apple metal version 32023.922 (metalfe-32023.922.4)\nTarget: air64-apple-darwin\n");
+                return 0;
+            }
+        }
+        NSString *outPath = nil, *inPath = nil;
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "-o") && i + 1 < argc) outPath = @(argv[++i]);
+            else if (argv[i][0] != '-') inPath = @(argv[i]);
+        }
+        if (!inPath || !outPath) return 0;
+        NSString *src = [NSString stringWithContentsOfFile:inPath encoding:NSUTF8StringEncoding error:nil];
+        if (!src) return 1;
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        MTLCompileOptions *opts = [MTLCompileOptions new];
+        opts.languageVersion = MTLLanguageVersion3_0;
+        NSError *err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
+        if (!lib) { fprintf(stderr, "%s\n", err.localizedDescription.UTF8String); return 1; }
+        return [lib serializeToURL:[NSURL fileURLWithPath:outPath] error:&err] ? 0 : 1;
+    }
+}
+EOF
+BIN_DIR="${VIRTUAL_ENV:-$HOME/.local}/bin"
+mkdir -p "$BIN_DIR"
+clang -O2 -framework Metal -framework Foundation /tmp/metal_shim.m -o "$BIN_DIR/metal"
+ln -sf "$BIN_DIR/metal" "$BIN_DIR/metallib"
+```
+
+3. **Build the game**: Prepend the shim directory to `PATH` and disable precompiled headers via `DMSH_PCH=0`:
+
+```bash
+PATH="$BIN_DIR:$PATH" DMSH_PCH=0 python3 scripts/build_ipa_from_nsp.py ~/Games/YourGame --platform mac
+```
+
+To compile the native host directly without repackaging:
+```bash
+make -C dm/host GAME=<TITLE_ID> dmhost
+```
 
 ### Install
 
